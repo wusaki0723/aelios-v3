@@ -1,0 +1,810 @@
+import { authenticate } from "../auth/apiKey";
+import { getOrCreateConversation } from "../db/conversations";
+import { fetchMemoriesByIds, getMemoryById, listMemoriesPage } from "../db/memories";
+import { saveIngestMessages } from "../db/messages";
+import {
+  archiveMemory,
+  createPrecious,
+  deleteMemoryV2,
+  fetchMemoryLifecycleRows,
+  getDailyLog,
+  getWeeklyLog,
+  getPreciousById,
+  markPreciousInjected,
+  supersedeMemory,
+  upsertGlossary,
+  upsertMemoryByFactKey
+} from "../db/v2";
+import { filterAndCompressMemories } from "../memory/filter";
+import { exportMemories } from "../memory/export";
+import { buildBootPackage, isV2Enabled, runRecall } from "../memory/v2/recall";
+import { readDreamTimeZoneFromEnv } from "../memory/dailyDigest";
+import { getIsoWeekLabelForDateLabel } from "../memory/weeklyRollup";
+import { toMemoryApiRecord } from "../memory/search";
+import {
+  createVectorMemory,
+  deleteVectorMemory,
+  getVectorMemory,
+  listVectorMemories,
+  searchVectorMemories
+} from "../memory/vectorStore";
+
+import type { Env, KeyProfile, Scope } from "../types";
+import { json } from "../utils/json";
+import {
+  isRecord,
+  readBoolean,
+  readMessages,
+  readNonNegativeInt,
+  readNumber,
+  readPositiveInt,
+  readString,
+  readStringArray,
+  resolveNamespace
+} from "../utils/request";
+
+type JsonRpcId = string | number | null;
+
+interface JsonRpcRequest {
+  jsonrpc?: "2.0";
+  id?: JsonRpcId;
+  method?: string;
+  params?: unknown;
+}
+
+interface ToolCallParams {
+  name?: unknown;
+  arguments?: unknown;
+}
+
+function withTokenQuery(request: Request): Request {
+  const url = new URL(request.url);
+  const token = url.searchParams.get("token");
+  if (!token || request.headers.has("authorization")) return request;
+
+  const headers = new Headers(request.headers);
+  headers.set("authorization", `Bearer ${token}`);
+  return new Request(request.url, { headers });
+}
+
+function hasScope(profile: KeyProfile, scope: Scope): boolean {
+  return profile.scopes.includes(scope);
+}
+
+function rpcResult(id: JsonRpcId | undefined, result: unknown): Record<string, unknown> {
+  return { jsonrpc: "2.0", id: id ?? null, result };
+}
+
+function rpcError(id: JsonRpcId | undefined, code: number, message: string): Record<string, unknown> {
+  return {
+    jsonrpc: "2.0",
+    id: id ?? null,
+    error: { code, message }
+  };
+}
+
+function textToolResult(data: unknown): Record<string, unknown> {
+  return {
+    content: [
+      {
+        type: "text",
+        text: typeof data === "string" ? data : JSON.stringify(data, null, 2)
+      }
+    ],
+    structuredContent: data
+  };
+}
+
+function toolError(message: string): Record<string, unknown> {
+  return {
+    content: [{ type: "text", text: message }],
+    isError: true
+  };
+}
+
+function getTools(): Array<Record<string, unknown>> {
+  return [
+    {
+      name: "memory_search",
+      description: "Search the user's long-term memory library.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          top_k: { type: "number", minimum: 1, maximum: 50 },
+          types: { type: "array", items: { type: "string" } },
+          namespace: { type: "string" }
+        },
+        required: ["query"]
+      }
+    },
+    {
+      name: "memory_list",
+      description: "List memories from the user's memory library.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: "number", minimum: 1, maximum: 1000 },
+          cursor: { type: "string" },
+          offset: { type: "number", minimum: 0 },
+          include_ids: { type: "boolean" },
+          type: { type: "string" },
+          status: { type: "string" },
+          namespace: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "memory_export",
+      description: "Bulk export memory records as JSON, including content and metadata.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          type: { type: "string" },
+          format: { type: "string", enum: ["json"] },
+          namespace: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "memory_get",
+      description: "Get one memory from the Vectorize memory library by id.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          id: { type: "string" }
+        },
+        required: ["id"]
+      }
+    },
+    {
+      name: "memory_delete",
+      description: "Delete one memory from the Vectorize memory library by id.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          id: { type: "string" }
+        },
+        required: ["id"]
+      }
+    },
+    {
+      name: "memory_ingest",
+      description: "Save chat messages and optionally extract memories from them.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          messages: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                role: { type: "string" },
+                content: {}
+              },
+              required: ["role", "content"]
+            }
+          },
+          conversation_id: { type: "string" },
+          source: { type: "string" },
+          auto_extract: { type: "boolean" },
+          namespace: { type: "string" }
+        },
+        required: ["messages"]
+      }
+    },
+    // --- Aelios 记忆库 v2 端点 (母帖 #11 第 2 步) ---
+    // 全部走 MEMORY_LIFECYCLE_ENABLED 总闸；关时返回未启用。
+    {
+      name: "memory_boot",
+      description:
+        "Cold-start package: yesterday log + top pinned precious + all glossary. " +
+        "Output is stable and deterministically ordered so the client can cache it. " +
+        "Call once on SessionStart.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "memory_recall",
+      description:
+        "Per-turn dynamic recall: glossary literal hits + memories(active) vector + world_fact " +
+        "+ longtail fallback. Gate 3 inject-decay on last_injected_at. Gate 2 dedups hits against " +
+        "the core layer (precious) so the model isn't re-fed what it already knows this turn. " +
+        "Precious is NOT queried here (gate 1: it lives in boot). Call on UserPromptSubmit.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          k: { type: "number", minimum: 1, maximum: 100 },
+          min_score: { type: "number", minimum: 0, maximum: 1 },
+          types: { type: "array", items: { type: "string" } },
+          namespace: { type: "string" },
+          include_history: {
+            type: "boolean",
+            description:
+              "When true, include superseded memory versions (status/version_status=superseded). Default false."
+          }
+        },
+        required: ["query"]
+      }
+    },
+    {
+      name: "memory_pin",
+      description: "Mark a memory as precious (L3, pinned, exempt from dedup/decay/delete). " +
+        "Store with surrounding context so a single line stays interpretable later.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          content: { type: "string" },
+          context_message_ids: { type: "array", items: { type: "string" } },
+          namespace: { type: "string" }
+        },
+        required: ["content"]
+      }
+    },
+    {
+      name: "glossary_set",
+      description: "Add or update a glossary term (L5, literal recall, not in vector index). " +
+        "Upsert by (namespace, term).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          term: { type: "string" },
+          aliases: { type: "array", items: { type: "string" } },
+          definition: { type: "string" },
+          examples: { type: "array", items: { type: "string" } },
+          namespace: { type: "string" }
+        },
+        required: ["term", "definition"]
+      }
+    },
+    {
+      name: "memory_upsert",
+      description:
+        "Assert/update a refined memory by fact_key (no waiting for dream). " +
+        "world_fact also uses this with type='world_fact'. " +
+        "E-axis: pass authored_by (your signature) + optional response_tendency (one line on how to act " +
+        "when this memory fires) to mark it hand-authored — hand-authored memories rank above distilled " +
+        "ones and are protected from dream/judge overwrite.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          fact_key: { type: "string" },
+          content: { type: "string" },
+          type: { type: "string" },
+          importance: { type: "number" },
+          confidence: { type: "number" },
+          tags: { type: "array", items: { type: "string" } },
+          source: { type: "string" },
+          valid_as_of: { type: "string" },
+          authored_by: { type: "string", description: "E-axis signature; only honored on hand sources (mcp/manual/api)" },
+          response_tendency: { type: "string", description: "E-axis: how to respond when this memory fires" },
+          namespace: { type: "string" }
+        },
+        required: ["fact_key", "content"]
+      }
+    },
+    {
+      name: "memory_supersede",
+      description:
+        "Mark old_id as superseded and insert a new active entry, linking the supersede chain. " +
+        "Used for world_fact updates that invalidate older entries.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          old_id: { type: "string" },
+          new_content: { type: "string" },
+          new_type: { type: "string" },
+          new_fact_key: { type: "string" },
+          valid_as_of: { type: "string" },
+          reason: { type: "string" },
+          authored_by: { type: "string", description: "E-axis signature for the new entry (hand sources only)" },
+          response_tendency: { type: "string" },
+          namespace: { type: "string" }
+        },
+        required: ["old_id", "new_content"]
+      }
+    },
+    {
+      name: "memory_archive",
+      description: "Soft-archive a memory (status='archived'). Does not touch the supersede chain.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          namespace: { type: "string" }
+        },
+        required: ["id"]
+      }
+    },
+    {
+      name: "diary_get",
+      description:
+        "Read daily_log diary entries. Omit date for today+yesterday (recent). " +
+        "Use week (e.g. 2026-W29) for weekly_log. Rolled-up daily dates fall back to weekly_log. " +
+        "Diary is never auto-injected; fetch explicitly when needed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          date: { type: "string", description: "YYYY-MM-DD; omit for recent (today+yesterday)" },
+          week: { type: "string", description: "ISO week label, e.g. 2026-W29" },
+          namespace: { type: "string" }
+        }
+      }
+    }
+  ];
+}
+
+async function callTool(
+  env: Env,
+  ctx: ExecutionContext,
+  profile: KeyProfile,
+  params: ToolCallParams
+): Promise<Record<string, unknown>> {
+  const args = isRecord(params.arguments) ? params.arguments : {};
+
+  if (params.name === "memory_search") {
+    if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
+    const query = readString(args.query);
+    if (!query) return toolError("query is required");
+    const memories = await searchVectorMemories(env, {
+      namespace: resolveNamespace(profile, args.namespace),
+      query,
+      topK: readNumber(args.top_k, Number(env.MEMORY_TOP_K || 50)),
+      types: readStringArray(args.types)
+    });
+    const data = await filterAndCompressMemories(env, { query, memories });
+    return textToolResult({ data });
+  }
+
+  if (params.name === "memory_create") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    if (isV2Enabled(env)) return toolError("memory_create is deprecated in v2; use memory_upsert with fact_key");
+    const content = readString(args.content);
+    if (!content) return toolError("content is required");
+    let memory;
+    try {
+      memory = await createVectorMemory(env, {
+        namespace: resolveNamespace(profile, args.namespace),
+        type: readString(args.type) || "note",
+        content,
+        summary: readString(args.summary) || null,
+        importance: readNumber(args.importance, 0.5),
+        confidence: readNumber(args.confidence, 0.8),
+        pinned: readBoolean(args.pinned),
+        tags: readStringArray(args.tags),
+        source: readString(args.source) || "mcp",
+        sourceMessageIds: []
+      });
+    } catch (error) {
+      return toolError(error instanceof Error ? error.message : "memory_create failed");
+    }
+    return textToolResult({ data: memory });
+  }
+
+  if (params.name === "memory_list") {
+    if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
+    const limit = readPositiveInt(args.limit, 100, 1000);
+    const namespace = resolveNamespace(profile, args.namespace);
+
+    // v2: 走 D1 (本体)，能列出 fact_key upsert 写入的记录。
+    // v1: 走 Vectorize (向量是当时唯一存储)。
+    if (isV2Enabled(env)) {
+      const page = await listMemoriesPage(env.DB, {
+        namespace,
+        type: readString(args.type),
+        status: readString(args.status) ?? "active",
+        limit,
+        offset: readNonNegativeInt(args.offset ?? 0, 0, 1000000)
+      });
+      const lifecycleRows = await fetchMemoryLifecycleRows(env.DB, page.records.map((r) => r.id));
+      const lifecycleByMemoryId = new Map(lifecycleRows.map((lc) => [lc.memory_id, lc]));
+      return textToolResult({
+        data: page.records.map((r) => toMemoryApiRecord(r, undefined, lifecycleByMemoryId.get(r.id) ?? null)),
+        paging: {
+          limit,
+          has_more: page.hasMore,
+          next_offset: page.nextOffset
+        }
+      });
+    }
+
+    try {
+      const page = await listVectorMemories(env, {
+        namespace,
+        count: limit,
+        cursor: readString(args.cursor),
+        type: readString(args.type) ?? undefined,
+        status: readString(args.status) ?? undefined
+      });
+      return textToolResult({
+        data: page.data,
+        ...(readBoolean(args.include_ids) ? { ids: page.ids } : {}),
+        paging: {
+          limit,
+          cursor: page.cursor,
+          has_more: page.hasMore,
+          count: page.count,
+          total_count: page.totalCount
+        }
+      });
+    } catch (error) {
+      return toolError(error instanceof Error ? error.message : "memory_list failed");
+    }
+  }
+
+  if (params.name === "memory_export") {
+    if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
+    if (!hasScope(profile, "export:read")) return toolError("Missing export:read scope");
+    try {
+      const result = await exportMemories(env, {
+        namespace: resolveNamespace(profile, args.namespace),
+        type: readString(args.type),
+        format: readString(args.format) || "json"
+      });
+      return textToolResult(result);
+    } catch (error) {
+      return toolError(error instanceof Error ? error.message : "memory_export failed");
+    }
+  }
+
+  if (params.name === "memory_get") {
+    if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
+    const id = readString(args.id);
+    if (!id) return toolError("id is required");
+
+    // v2: 走 D1，能拿到 fact_key upsert / supersede 写入的记录。
+    if (isV2Enabled(env)) {
+      const record = await getMemoryById(env.DB, {
+        namespace: resolveNamespace(profile, args.namespace),
+        id
+      });
+      if (!record) return toolError("Memory not found");
+      const lifecycleRows = await fetchMemoryLifecycleRows(env.DB, [record.id]);
+      return textToolResult({ data: toMemoryApiRecord(record, undefined, lifecycleRows[0] ?? null) });
+    }
+
+    const memory = await getVectorMemory(env, id);
+    if (!memory) return toolError("Memory not found");
+    return textToolResult({ data: memory });
+  }
+
+  if (params.name === "memory_delete") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    const id = readString(args.id);
+    if (!id) return toolError("id is required");
+
+    // v2: 硬删 D1 + 向量 (本体和镜像一起删)，找不到返回 false。
+    if (isV2Enabled(env)) {
+      const deleted = await deleteMemoryV2(env, {
+        namespace: resolveNamespace(profile, args.namespace),
+        id
+      });
+      if (!deleted) return toolError("Memory not found");
+      return textToolResult({ data: { id, deleted: true } });
+    }
+
+    await deleteVectorMemory(env, id);
+    return textToolResult({
+      data: {
+        id,
+        deleted: true
+      }
+    });
+  }
+
+  if (params.name === "memory_ingest") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    const messages = readMessages(args.messages);
+    if (messages.length === 0) return toolError("messages must contain at least one message");
+    const namespace = resolveNamespace(profile, args.namespace);
+    const conversation = await getOrCreateConversation(env.DB, {
+      namespace,
+      id: readString(args.conversation_id)
+    });
+    const source = readString(args.source) || "mcp";
+    const ids = await saveIngestMessages(env.DB, {
+      conversationId: conversation.id,
+      namespace,
+      source,
+      messages
+    });
+
+    return textToolResult({
+      data: {
+        conversation_id: conversation.id,
+        message_ids: ids,
+        auto_extract: args.auto_extract !== false
+      }
+    });
+  }
+
+
+
+  // --- Aelios 记忆库 v2 端点 (母帖 #11 第 2 步) ---
+  // 全部走 MEMORY_LIFECYCLE_ENABLED 总闸；关时返回未启用，不碰 v2 表。
+
+  if (params.name === "memory_boot") {
+    if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
+    if (!isV2Enabled(env)) return toolError("memory_boot requires MEMORY_LIFECYCLE_ENABLED=true");
+    const bootNamespace = resolveNamespace(profile, args.namespace);
+    const pkg = await buildBootPackage(env, {
+      namespace: bootNamespace
+    });
+    // Injection accounting moved out of buildBootPackage; schedule off response path.
+    if (pkg.precious.length > 0) {
+      ctx.waitUntil(
+        markPreciousInjected(env.DB, {
+          namespace: bootNamespace,
+          ids: pkg.precious.map((p) => p.id)
+        })
+      );
+    }
+    return textToolResult({ data: pkg });
+  }
+
+  if (params.name === "memory_recall") {
+    if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
+    if (!isV2Enabled(env)) return toolError("memory_recall requires MEMORY_LIFECYCLE_ENABLED=true");
+    const query = readString(args.query);
+    if (!query) return toolError("query is required");
+    const result = await runRecall(env, {
+      namespace: resolveNamespace(profile, args.namespace),
+      query,
+      k: readNumber(args.k, 20),
+      min_score: typeof args.min_score === "number" ? readNumber(args.min_score, 0.15) : undefined,
+      types: readStringArray(args.types),
+      include_history: readBoolean(args.include_history, false)
+    });
+    return textToolResult({ data: result });
+  }
+
+  if (params.name === "memory_pin") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    if (!isV2Enabled(env)) return toolError("memory_pin requires MEMORY_LIFECYCLE_ENABLED=true");
+    const content = readString(args.content);
+    if (!content) return toolError("content is required");
+    const precious = await createPrecious(env.DB, {
+      namespace: resolveNamespace(profile, args.namespace),
+      content,
+      contextMessageIds: readStringArray(args.context_message_ids)
+    });
+    return textToolResult({ data: precious });
+  }
+
+  if (params.name === "glossary_set") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    if (!isV2Enabled(env)) return toolError("glossary_set requires MEMORY_LIFECYCLE_ENABLED=true");
+    const term = readString(args.term);
+    const definition = readString(args.definition);
+    if (!term) return toolError("term is required");
+    if (!definition) return toolError("definition is required");
+    const row = await upsertGlossary(env.DB, {
+      namespace: resolveNamespace(profile, args.namespace),
+      term,
+      aliases: readStringArray(args.aliases),
+      definition,
+      examples: readStringArray(args.examples)
+    });
+    return textToolResult({ data: row });
+  }
+
+  if (params.name === "memory_upsert") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    if (!isV2Enabled(env)) return toolError("memory_upsert requires MEMORY_LIFECYCLE_ENABLED=true");
+    const factKey = readString(args.fact_key);
+    const content = readString(args.content);
+    if (!factKey) return toolError("fact_key is required");
+    if (!content) return toolError("content is required");
+    try {
+      const result = await upsertMemoryByFactKey(env, {
+        namespace: resolveNamespace(profile, args.namespace),
+        factKey,
+        content,
+        type: readString(args.type) || "fact",
+        importance: readNumber(args.importance, 0.6),
+        confidence: readNumber(args.confidence, 0.8),
+        tags: readStringArray(args.tags),
+        source: readString(args.source) || "mcp",
+        validAsOf: readString(args.valid_as_of),
+        authoredBy: readString(args.authored_by) || null,
+        responseTendency: readString(args.response_tendency) || null
+      });
+      return textToolResult({ data: result });
+    } catch (error) {
+      return toolError(error instanceof Error ? error.message : "memory_upsert failed");
+    }
+  }
+
+  if (params.name === "memory_supersede") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    if (!isV2Enabled(env)) return toolError("memory_supersede requires MEMORY_LIFECYCLE_ENABLED=true");
+    const oldId = readString(args.old_id);
+    const newContent = readString(args.new_content);
+    if (!oldId) return toolError("old_id is required");
+    if (!newContent) return toolError("new_content is required");
+    try {
+      const result = await supersedeMemory(env, {
+        namespace: resolveNamespace(profile, args.namespace),
+        oldId,
+        newContent,
+        newType: readString(args.new_type) || "world_fact",
+        newFactKey: readString(args.new_fact_key),
+        validAsOf: readString(args.valid_as_of),
+        reason: readString(args.reason),
+        // MCP 走的是亲手通道：source 记 "mcp"，E 轴字段随之生效 (也能亲手 supersede 亲笔记忆)。
+        source: "mcp",
+        authoredBy: readString(args.authored_by) || null,
+        responseTendency: readString(args.response_tendency) || null
+      });
+      return textToolResult({ data: result });
+    } catch (error) {
+      return toolError(error instanceof Error ? error.message : "memory_supersede failed");
+    }
+  }
+
+  if (params.name === "memory_archive") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    if (!isV2Enabled(env)) return toolError("memory_archive requires MEMORY_LIFECYCLE_ENABLED=true");
+    const id = readString(args.id);
+    if (!id) return toolError("id is required");
+    const archived = await archiveMemory(env, {
+      namespace: resolveNamespace(profile, args.namespace),
+      id
+    });
+    if (!archived) return toolError("Memory not found");
+    return textToolResult({ data: { id, archived: true } });
+  }
+
+  if (params.name === "digest_get" || params.name === "digest_set") {
+    return toolError(
+      `${params.name} is deprecated in v3; digest lives in the client system prompt. Use diary_get for daily_log.`
+    );
+  }
+
+  if (params.name === "memory_extract_dryrun") {
+    return toolError(
+      "memory_extract_dryrun is deprecated in v3; extraction runs via the dream nightly pipeline. Use dream dry_run endpoints instead."
+    );
+  }
+
+  if (params.name === "diary_get") {
+    if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
+    const namespace = resolveNamespace(profile, args.namespace);
+    const timeZone = readDreamTimeZoneFromEnv(env);
+    const week = readString(args.week);
+    if (week && !/^\d{4}-W\d{2}$/.test(week)) {
+      return toolError("week must be YYYY-Www (ISO week label)");
+    }
+    if (week) {
+      const row = await getWeeklyLog(env.DB, { namespace, week });
+      if (!row) return textToolResult({ data: null });
+      return textToolResult({ data: row });
+    }
+    const date = readString(args.date);
+    if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return toolError("date must be YYYY-MM-DD");
+    }
+    if (date) {
+      const row = await getDailyLog(env.DB, { namespace, date });
+      if (row) return textToolResult({ data: row });
+      const weekLabel = getIsoWeekLabelForDateLabel(date, timeZone);
+      const weekly = await getWeeklyLog(env.DB, { namespace, week: weekLabel });
+      if (!weekly) return textToolResult({ data: null });
+      return textToolResult({ data: { ...weekly, note: "daily rolled into weekly" } });
+    }
+    const today = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).format(new Date());
+    const yesterday = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).format(new Date(Date.now() - 24 * 60 * 60 * 1000));
+    const rows = await Promise.all([
+      getDailyLog(env.DB, { namespace, date: today }),
+      getDailyLog(env.DB, { namespace, date: yesterday })
+    ]);
+    return textToolResult({ data: rows.filter((row) => row !== null) });
+  }
+
+  return toolError(`Unknown tool: ${String(params.name || "")}`);
+}
+
+async function handleRpc(
+  request: JsonRpcRequest,
+  env: Env,
+  ctx: ExecutionContext,
+  profile: KeyProfile
+): Promise<Record<string, unknown> | null> {
+  if (!request.id && request.method?.startsWith("notifications/")) return null;
+
+  if (request.method === "initialize") {
+    return rpcResult(request.id, {
+      protocolVersion: "2025-06-18",
+      capabilities: { tools: { listChanged: false } },
+      serverInfo: { name: "companion-memory-mcp", version: "0.1.0" }
+    });
+  }
+
+  if (request.method === "tools/list") {
+    return rpcResult(request.id, { tools: getTools() });
+  }
+
+  if (request.method === "resources/list") {
+    return rpcResult(request.id, { resources: [] });
+  }
+
+  if (request.method === "prompts/list") {
+    return rpcResult(request.id, { prompts: [] });
+  }
+
+  if (request.method === "tools/call") {
+    const params = isRecord(request.params) ? (request.params as ToolCallParams) : {};
+    const result = await callTool(env, ctx, profile, params);
+    return rpcResult(request.id, result);
+  }
+
+  if (request.method === "ping") {
+    return rpcResult(request.id, {});
+  }
+
+  return rpcError(request.id, -32601, "Method not found");
+}
+
+export async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204 });
+  }
+
+  if (request.method === "GET") {
+    return json({
+      name: "companion-memory-mcp",
+      transport: "streamable-http",
+      endpoint: new URL(request.url).pathname,
+      tools: getTools().map((tool) => tool.name)
+    });
+  }
+
+  if (request.method !== "POST") {
+    return json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  const auth = await authenticate(withTokenQuery(request), env);
+  if (!auth.ok) return rpcErrorResponse(null, -32001, "Unauthorized", 401);
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return rpcErrorResponse(null, -32700, "Parse error", 400);
+  }
+
+  if (Array.isArray(body)) {
+    const results = (
+      await Promise.all(
+        body
+          .filter((item): item is JsonRpcRequest => isRecord(item))
+          .map((item) => handleRpc(item, env, ctx, auth.profile))
+      )
+    ).filter((item): item is Record<string, unknown> => item !== null);
+    return results.length > 0 ? json(results) : new Response(null, { status: 202 });
+  }
+
+  if (!isRecord(body)) return rpcErrorResponse(null, -32600, "Invalid Request", 400);
+
+  const result = await handleRpc(body, env, ctx, auth.profile);
+  return result ? json(result) : new Response(null, { status: 202 });
+}
+
+function rpcErrorResponse(id: JsonRpcId | undefined, code: number, message: string, status: number): Response {
+  return json(rpcError(id, code, message), { status });
+}

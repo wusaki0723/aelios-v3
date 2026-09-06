@@ -1,0 +1,99 @@
+name = "aelios-v3"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+keep_vars = true
+
+# Workers Cache: only GET /health (max-age=30) and GET /v1/models (max-age=300) send Cache-Control.
+[cache]
+enabled = true
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
+
+[triggers]
+# Cloudflare cron uses UTC. 20:10 UTC is 04:10 in Singapore/China time.
+crons = ["10 20 * * *"]
+
+[ai]
+binding = "AI"
+
+[vars]
+# Deployment defaults. Everything here can be overridden from /admin/gateway
+# without touching Cloudflare Variables; the page shows these values as hints.
+AI_GATEWAY_ID = "default"
+PUBLIC_MODEL_NAME = "companion"
+CHAT_MODEL = "deepseek/deepseek-v4-pro"
+MEMORY_FILTER_MAX_CANDIDATES = "12"
+MEMORY_FILTER_MAX_OUTPUT = "3"
+MEMORY_FILTER_MAX_CONTENT_CHARS = "700"
+# Recall floor on the raw embedding score, applied BEFORE the reranker. Low on
+# purpose: embeddinggemma under-scores reworded-but-relevant hits (~0.15-0.20).
+# Precision is handled by the reranker downstream.
+MEMORY_FILTER_MIN_SCORE = "0.1"
+DREAM_MODEL = "workers-ai/@cf/openai/gpt-oss-120b"
+DEDUP_COSINE = "0.9"
+VISION_MODEL = "workers-ai/@cf/google/gemma-4-26b-a4b-it"
+# Vector recall floor (see MEMORY_FILTER_MIN_SCORE note above). Precision is
+# handled by the reranker + compressor, so keep this as a garbage gate only.
+MEMORY_MIN_SCORE = "0.1"
+MEMORY_TOP_K = "50"
+# 闸三降权系数 (#37 修正后): 只压排序，不参与 RECALL_MIN_SCORE 地板判定。
+# 修正前 0.15×命中分 ≤ 0.15 地板，30 分钟内注入过的记忆被绝对拉黑 (直接追问也召不回)。
+# 现在 0.15 = 窗口内命中重排到队尾；若它是唯一相关命中照样返回。地板判原始相关性分。
+MEMORY_INJECT_DECAY_FACTOR = "0.15"
+# E 轴: 亲笔记忆 (authored_by 非空) 排序加成，只影响排序不影响地板。"1" 关闭。
+MEMORY_AUTHORED_BOOST = "1.15"
+# 审阅闸: cron 周记落成待审，不顺手删 daily_log；审过走 POST /admin/weekly-approve 亲手删。
+# 设 "true" 恢复旧的一条龙 (生成+落库+删日志，链上无人)。
+WEEKLY_ROLLUP_DELETE_DAILIES = "false"
+MEMORY_RERANKER_MODEL = "workers-ai/@cf/baai/bge-reranker-base"
+VECTORIZE_INDEX_NAME = "memo-kb"
+EMBEDDING_MODEL = "workers-ai/@cf/baai/bge-m3"
+EMBEDDING_DIMENSIONS = "1024"
+# messages 表保留天数；后台 retention 按 namespace 24h 节流清理。
+MESSAGES_RETENTION_DAYS = "7"
+DREAM_TIME_ZONE = "Asia/Singapore"
+DREAM_MAX_MESSAGES = "40"
+DREAM_MEMORY_CONTEXT_LIMIT = "40"
+DREAM_MAX_RUNS = "10"
+DREAM_MAX_TOKENS = "8000"
+# GitHub daily archive pull（可选，默认禁用）。要用：去 Dashboard 手动加变量
+# GITHUB_DAILY_REPO（owner/repo）和 Secret GITHUB_DAILY_TOKEN（fine-grained PAT，
+# 只读目标仓库 Contents）；代码内默认路径 archive/daily，可用 GITHUB_DAILY_PATH 覆盖。
+# 注意：空值 var 别写进本文件——Deploy 按钮的表单会把空 vars 渲染成必填项，挡住一键部署。
+
+# Private/account-specific variables live in the Cloudflare Dashboard:
+# AI_GATEWAY_BASE_URL, CHATBOX_API_KEY, MEMORY_MCP_API_KEY,
+# GUIDE_DOG_API_KEY, CF_AIG_TOKEN.
+# D1 binding is auto-filled by `npm run setup:cloudflare`.
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "memo-kb"
+
+[[queues.producers]]
+binding = "MEMORY_QUEUE"
+queue = "companion-memory"
+
+[[queues.consumers]]
+queue = "companion-memory"
+max_batch_size = 10
+max_batch_timeout = 30
+
+# 不写 database_id：Deploy 按钮 / wrangler 自动开资源按名字建库，
+# `npm run deploy` 里的 setup 脚本会在部署时回填真实 ID（只落在构建环境，不进 git）。
+[[d1_databases]]
+binding = "DB"
+database_name = "companion_memory_proxy"

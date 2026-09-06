@@ -1,0 +1,8 @@
+# Aelios 密钥表单（Deploy to Cloudflare 按钮照这份文件生成填写项；
+# 本地开发则复制成 .dev.vars 再填值）。
+#
+# 只有这一项要填。可选功能的密钥（MCP 第二钥匙、看图、聊天网关、维护工具）
+# 都在用到时再去 Dashboard 加，清单见 SECRETS.md，这里不摆空坑。
+
+# ★ 自己编一个密码，客户端连 Aelios 时当 API Key 用。
+CHATBOX_API_KEY="sk-my-aelios"

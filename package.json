@@ -1,0 +1,36 @@
+{
+  "name": "aelios-v3",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "npm run setup:cloudflare && wrangler deploy --keep-vars",
+    "setup:cloudflare": "node scripts/setup-cloudflare.mjs",
+    "deploy:cloudflare": "npm run deploy",
+    "deploy:bare": "wrangler deploy --keep-vars",
+    "typecheck": "tsc --noEmit",
+    "test:gateway": "node --import tsx --test tests/gateway.test.ts",
+    "verify": "npm run typecheck && npm run test:gateway && node scripts/verify-assembler.mjs && node scripts/verify-vector-memory-write.mjs && node --import tsx scripts/verify-dedup-gate.mjs && node --import tsx scripts/verify-sanitize.mjs && node --import tsx scripts/verify-week-blocks.mjs",
+    "vectorize:clean": "node scripts/clean-vectorize-memory.mjs",
+    "vectorize:clean:llm": "node scripts/llm-clean-vectorize-memory.mjs",
+    "memory:deep-clean": "node scripts/deep-clean-memories.mjs",
+    "cache:test": "node scripts/test-claude-cache.mjs",
+    "db:migrate:local": "wrangler d1 migrations apply companion_memory_proxy --local",
+    "db:migrate:remote": "wrangler d1 migrations apply companion_memory_proxy --remote"
+  },
+  "cloudflare": {
+    "bindings": {
+      "CHATBOX_API_KEY": {
+        "description": "自己编一个密码（如 `sk-my-aelios`），客户端连 Aelios 时当 API Key 用。唯一要填的密钥，其余可选功能的钥匙见 SECRETS.md。"
+      }
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250927.0",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.40.2"
+  }
+}

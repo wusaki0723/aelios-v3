@@ -1,0 +1,11 @@
+node_modules/
+.wrangler/
+.dev.vars
+.env
+.wrangler-secrets.json
+backups/
+dist/
+
+# build-process analysis files
+.analysis-cache.md
+.analysis-archive/
